@@ -27,9 +27,12 @@ def ingest_file(file_path: str | Path, filename: str = "") -> Dict[str, pd.DataF
             f"Unsupported file type '{ext}'. Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
         )
 
+    # Prefer the original filename stem over the temp-file UUID stem
+    original_stem = Path(filename).stem if filename else ""
+
     if ext == ".csv":
         df = _read_csv(path)
-        stem = _safe_name(path.stem or filename or "table")
+        stem = _safe_name(original_stem or path.stem or "table")
         return {stem: df}
 
     elif ext in (".xlsx", ".xls"):
@@ -37,7 +40,7 @@ def ingest_file(file_path: str | Path, filename: str = "") -> Dict[str, pd.DataF
 
     elif ext == ".json":
         df = _read_json(path)
-        stem = _safe_name(path.stem or filename or "table")
+        stem = _safe_name(original_stem or path.stem or "table")
         return {stem: df}
 
     return {}

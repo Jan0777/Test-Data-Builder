@@ -56,37 +56,64 @@ def health_check():
 @app.post("/replicate")
 async def replicate_file(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
     row_count: Optional[int] = Form(None),
 ):
-    content = await file.read()
-    filename = file.filename or "upload"
-    suffix = Path(filename).suffix.lower() or ".csv"
+    if not files:
+        raise HTTPException(status_code=400, detail={"error": "No files provided"})
 
-    tmp_path = UPLOADS_DIR / f"{uuid.uuid4()}{suffix}"
-    with open(tmp_path, "wb") as f:
-        f.write(content)
+    saved: List[Dict[str, str]] = []
+    for upload in files:
+        content = await upload.read()
+        filename = upload.filename or "upload"
+        suffix = Path(filename).suffix.lower() or ".csv"
+        tmp_path = UPLOADS_DIR / f"{uuid.uuid4()}{suffix}"
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+        saved.append({"path": str(tmp_path), "filename": filename})
 
-    job = await job_store.create(mode="replicate", filename=filename)
-    background_tasks.add_task(_run_replicate, job.job_id, str(tmp_path), filename, row_count)
+    combined_filename = ", ".join(s["filename"] for s in saved)
+    job = await job_store.create(mode="replicate", filename=combined_filename)
+    background_tasks.add_task(_run_replicate_multi, job.job_id, saved, row_count)
 
-    return {"job_id": job.job_id, "status": "pending", "message": "Profiling file..."}
+    return {"job_id": job.job_id, "status": "pending", "message": f"Profiling {len(saved)} file(s)..."}
 
 
-async def _run_replicate(job_id: str, file_path: str, filename: str, row_count: Optional[int]):
+async def _run_replicate_multi(
+    job_id: str,
+    saved: List[Dict[str, str]],
+    row_count: Optional[int],
+):
     job = job_store.get(job_id)
     if not job:
         return
 
+    tmp_paths = [s["path"] for s in saved]
+
     try:
-        job.set_running("Reading file...")
+        job.set_running(f"Reading {len(saved)} file(s)…")
         await asyncio.sleep(0)
 
         from backend.replicator.ingest import ingest_file
         from backend.replicator.profiler import profile_to_spec
 
-        frames = ingest_file(file_path, filename)
-        job.set_progress(20, "Profiling columns...")
+        # Ingest all files and merge frames (each file may produce multiple tables)
+        all_frames: Dict[str, Any] = {}
+        for i, entry in enumerate(saved):
+            pct = (i / len(saved)) * 15
+            job.set_progress(pct, f"Reading {entry['filename']}…")
+            await asyncio.sleep(0)
+            frames = ingest_file(entry["path"], entry["filename"])
+            # Deduplicate table names across files
+            for name, df in frames.items():
+                unique_name = name
+                suffix_idx = 1
+                while unique_name in all_frames:
+                    unique_name = f"{name}_{suffix_idx}"
+                    suffix_idx += 1
+                all_frames[unique_name] = df
+
+        job.set_progress(20, f"Profiling {len(all_frames)} table(s)…")
         await asyncio.sleep(0)
 
         has_llm = bool(os.environ.get("ANTHROPIC_API_KEY"))
@@ -95,34 +122,44 @@ async def _run_replicate(job_id: str, file_path: str, filename: str, row_count: 
         if has_llm:
             try:
                 from backend.llm.client import semantic_pass
-                for table_name, df in frames.items():
-                    profile = {col: {"type": str(df[col].dtype), "unique_count": int(df[col].nunique()), "null_pct": float(df[col].isna().mean())} for col in df.columns}
+                for table_name, df in all_frames.items():
+                    profile = {
+                        col: {
+                            "type": str(df[col].dtype),
+                            "unique_count": int(df[col].nunique()),
+                            "null_pct": float(df[col].isna().mean()),
+                        }
+                        for col in df.columns
+                    }
                     sample_rows = df.head(5).to_dict(orient="records")
                     labels = await semantic_pass(profile, sample_rows)
                     semantic_labels[table_name] = labels
             except Exception as e:
                 logger.warning(f"LLM semantic pass failed: {e}")
 
-        job.set_progress(50, "Building spec...")
+        job.set_progress(50, "Building generation spec…")
         await asyncio.sleep(0)
 
-        spec = profile_to_spec(frames, semantic_labels if semantic_labels else None, row_count)
-        job.set_progress(70, "Generating data...")
+        spec = profile_to_spec(
+            all_frames,
+            semantic_labels if semantic_labels else None,
+            row_count,
+        )
+        job.set_progress(70, "Generating synthetic data…")
         await asyncio.sleep(0)
 
         from backend.engine.generator import generate
         from backend.validation.report import generate_report
 
-        def progress(pct, msg):
-            job.set_progress(70 + pct * 0.25, msg)
+        def progress(pct: float, msg: str) -> None:
+            job.set_progress(70 + pct * 0.20, msg)
 
         generated = generate(spec, progress_cb=progress)
 
-        job.set_progress(90, "Generating fidelity report...")
+        job.set_progress(92, "Computing fidelity report…")
         await asyncio.sleep(0)
 
-        report = generate_report(generated, spec, source=frames)
-
+        report = generate_report(generated, spec, source=all_frames)
         result = _build_result(generated, report, job_id)
         spec_dict = spec.model_dump()
 
@@ -136,10 +173,11 @@ async def _run_replicate(job_id: str, file_path: str, filename: str, row_count: 
         logger.exception(f"Replicate job {job_id} failed")
         job.set_failed(str(e))
     finally:
-        try:
-            Path(file_path).unlink(missing_ok=True)
-        except Exception:
-            pass
+        for p in tmp_paths:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 @app.post("/create")

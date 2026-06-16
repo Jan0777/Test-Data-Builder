@@ -321,7 +321,12 @@ def _enforce_constraints(df: pd.DataFrame, table: TableSpec) -> pd.DataFrame:
                 if v in seen:
                     while True:
                         counter += 1
-                        candidate = f"{v}_{counter}" if col.type == "string" else (int(v) + counter if col.type == "integer" else v + counter * 0.001)
+                        if col.type == "integer" and not isinstance(v, str):
+                            candidate = int(v) + counter
+                        elif col.type == "float" and not isinstance(v, str):
+                            candidate = v + counter * 0.001
+                        else:
+                            candidate = f"{v}_{counter}"
                         if candidate not in seen:
                             v = candidate
                             break
