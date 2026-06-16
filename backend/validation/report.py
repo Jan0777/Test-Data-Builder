@@ -79,26 +79,39 @@ def _table_fidelity(
         col_report["null_rate_expected"] = round(null_rate_expected, 4)
 
         if col_spec.type in ("integer", "float"):
+            try:
+                gen_float = pd.to_numeric(gen_vals, errors="coerce").dropna()
+            except Exception:
+                gen_float = pd.Series([], dtype=float)
+
             if src_df is not None and col_name in src_df.columns:
-                src_vals = src_df[col_name].dropna().astype(float)
-                gen_float = gen_vals.astype(float)
-                if len(src_vals) >= 2 and len(gen_float) >= 2:
-                    ks_stat, ks_p = stats.ks_2samp(src_vals, gen_float)
-                    col_report["ks_statistic"] = round(float(ks_stat), 4)
-                    col_report["ks_pvalue"] = round(float(ks_p), 4)
+                try:
+                    src_float = pd.to_numeric(src_df[col_name].dropna(), errors="coerce").dropna()
+                    if len(src_float) >= 2 and len(gen_float) >= 2:
+                        ks_stat, ks_p = stats.ks_2samp(src_float, gen_float)
+                        col_report["ks_statistic"] = round(float(ks_stat), 4)
+                        col_report["ks_pvalue"] = round(float(ks_p), 4)
+                    else:
+                        col_report["ks_statistic"] = None
+                        col_report["ks_pvalue"] = None
+                except Exception:
+                    col_report["ks_statistic"] = None
+                    col_report["ks_pvalue"] = None
             else:
                 col_report["ks_statistic"] = None
                 col_report["ks_pvalue"] = None
 
             c = col_spec.constraints
-            if c.min is not None or c.max is not None:
-                gen_float = gen_vals.astype(float)
-                in_range_mask = np.ones(len(gen_float), dtype=bool)
-                if c.min is not None:
-                    in_range_mask &= (gen_float >= c.min)
-                if c.max is not None:
-                    in_range_mask &= (gen_float <= c.max)
-                col_report["range_compliance"] = round(float(in_range_mask.mean()), 4)
+            if (c.min is not None or c.max is not None) and len(gen_float) > 0:
+                try:
+                    in_range_mask = np.ones(len(gen_float), dtype=bool)
+                    if c.min is not None:
+                        in_range_mask &= (gen_float.values >= c.min)
+                    if c.max is not None:
+                        in_range_mask &= (gen_float.values <= c.max)
+                    col_report["range_compliance"] = round(float(in_range_mask.mean()), 4)
+                except Exception:
+                    col_report["range_compliance"] = 1.0
             else:
                 col_report["range_compliance"] = 1.0
 

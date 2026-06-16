@@ -18,7 +18,7 @@ class GenerationStrategy(BaseModel):
 class ColumnSpec(BaseModel):
     name: str
     type: Literal["integer", "float", "string", "categorical", "datetime", "boolean"]
-    semantic_type: Literal["id", "name", "email", "address", "currency", "category", "date", "phone", "none"] = "none"
+    semantic_type: Literal["id", "name", "email", "address", "city", "state", "zip", "country", "currency", "category", "date", "phone", "url", "company", "none"] = "none"
     generation: Dict[str, Any] = Field(default_factory=dict)
     constraints: ColumnConstraints = Field(default_factory=ColumnConstraints)
 

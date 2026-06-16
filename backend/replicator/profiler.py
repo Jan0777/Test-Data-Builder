@@ -88,7 +88,9 @@ def _profile_column(
     if semantic_type == "none":
         semantic_type, faker_method = _guess_semantic(name, col_type)
 
-    if semantic_type != "none" and faker_method:
+    # Only override generation strategy for non-numeric columns — Faker produces strings,
+    # which would corrupt integer/float columns.
+    if semantic_type != "none" and faker_method and col_type not in ("integer", "float"):
         generation = {"strategy": "semantic", "params": {"faker_method": faker_method}}
 
     if is_pk and col_type == "integer":
@@ -196,18 +198,35 @@ def _guess_semantic(name: str, col_type: str):
     name_lower = name.lower()
     if any(k in name_lower for k in ("email", "e_mail", "mail")):
         return "email", "email"
-    if any(k in name_lower for k in ("name", "fullname", "full_name", "first_name", "last_name")):
+    if "first_name" in name_lower or name_lower == "firstname":
+        return "name", "first_name"
+    if "last_name" in name_lower or "surname" in name_lower or name_lower == "lastname":
+        return "name", "last_name"
+    if any(k in name_lower for k in ("fullname", "full_name")) or name_lower == "name":
         return "name", "name"
     if any(k in name_lower for k in ("phone", "mobile", "cell", "tel")):
         return "phone", "phone_number"
-    if any(k in name_lower for k in ("address", "street", "city", "zip", "postal")):
-        return "address", "address"
+    # Geographic — map each to the right Faker method
+    if any(k in name_lower for k in ("street", "address", "addr")):
+        return "address", "street_address"
+    if "city" in name_lower:
+        return "city", "city"
+    if "state" in name_lower and "zip" not in name_lower and "postal" not in name_lower:
+        return "state", "state"
+    if any(k in name_lower for k in ("zip", "postal", "postcode")):
+        return "zip", "postcode"
+    if "country" in name_lower:
+        return "country", "country"
     if any(k in name_lower for k in ("price", "salary", "wage", "amount", "cost", "revenue", "income")):
         return "currency", None
     if any(k in name_lower for k in ("category", "status", "type", "tier", "level")):
         return "category", None
     if any(k in name_lower for k in ("date", "time", "created", "updated", "at")):
         return "date", None
+    if any(k in name_lower for k in ("url", "website", "link", "href")):
+        return "url", "url"
+    if any(k in name_lower for k in ("company", "employer", "organization", "org")):
+        return "company", "company"
     if name_lower in ("id", "_id") or name_lower.endswith("_id") or name_lower.endswith("id"):
         return "id", None
     return "none", None
