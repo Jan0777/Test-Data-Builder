@@ -1,0 +1,152 @@
+# Build Prompt — Synthetic Data Studio (Replit, full-stack)
+
+> Paste this into Replit's Agent. It is ordered intentionally: the agent must build the spec and engine **before** the modes and UI. Don't let it jump to the frontend first.
+
+---
+
+## ROLE & GOAL
+
+You are building a full-stack web application called **Synthetic Data Studio**. It generates synthetic tabular data in two modes:
+
+1. **Replicator** — the user uploads a data file (CSV/XLSX/JSON); the app profiles it, learns its structure, distributions, and relationships, and generates a faithful synthetic replica.
+2. **Creator** — the user describes the tables they want in natural language; the app interprets the intent and generates synthetic tables matching it exactly.
+
+Both modes produce the same intermediate artifact — a **Generation Spec (JSON)** — which a single generation engine consumes. Build the spec and engine first; both modes plug into them.
+
+**Stack:** Python (FastAPI) backend + React (Vite) + TypeScript + Tailwind frontend, in one Replit project. Backend runs as a persistent process (not serverless) because generation is compute-heavy.
+
+---
+
+## ARCHITECTURE (build in this order)
+
+```
+REPLICATOR (profile file) ┐
+                          ├─► GENERATION SPEC (JSON) ─► ENGINE ─► tables ─► VALIDATION
+CREATOR (parse intent)    ┘
+```
+
+---
+
+## STEP 1 — Generation Spec (the contract). Build this FIRST.
+
+Define the spec with **Pydantic models** in `backend/spec/models.py`. The spec fully describes what to generate. Structure:
+
+- `version: str`
+- `tables: List[TableSpec]` where each `TableSpec` has:
+  - `name`, `row_count`, `primary_key`
+  - `columns: List[ColumnSpec]` — each column has `name`, `type` (integer/float/string/categorical/datetime/boolean), `semantic_type` (id/name/email/address/currency/category/date/phone/none), `generation` (a strategy object), `constraints` (`unique`, `nullable`, `min`, `max`).
+  - `intra_row_constraints` — list of rules like `{type: "arithmetic", rule: "total = qty * price"}` and `{type: "conditional", rule: "if status=='cancelled' then refund_date is not null"}`.
+- `relationships: List[RelationshipSpec]` — each has `parent`, `child`, `parent_key`, `child_key`, `cardinality` (distribution + params describing children-per-parent), `participation` (0–1, fraction of parents with ≥1 child), `conditional_correlations` (parent attribute → child attribute shift), `temporal` (e.g. `child.date >= parent.date`).
+
+**Generation strategies** (the `generation` object's `strategy` field): `sequential`, `numeric_distribution` (normal/lognormal/uniform/skewnormal with params), `categorical_sample` (value→probability map), `datetime_range`, `regex_pattern`, `semantic` (Faker/LLM), `derived` (computed from other columns), `foreign_key`.
+
+Also export an equivalent **JSON Schema** so the frontend can validate specs. Write 2–3 example spec JSON files by hand in `backend/spec/examples/` to test the engine before the modes exist.
+
+---
+
+## STEP 2 — Generation Engine (mode-agnostic). Build SECOND.
+
+In `backend/engine/`. Consumes a spec, returns DataFrames + a validation report. Pure logic, no UI, no LLM coupling. Pipeline:
+
+1. **Validate spec** — reject impossible/conflicting constraints BEFORE generating (e.g. "1000 unique 3-digit codes" is impossible — only 900 exist). Fail with a clear error listing the conflict.
+2. **Topological sort** — order tables parents-first from the relationship graph. Detect cycles; defer circular FKs to a backfill pass.
+3. **Generate root tables** (no FK deps) — sample each column per its strategy using NumPy/SciPy.
+4. **Generate child tables** — for each parent row, sample a child-count from the **cardinality distribution**, create that many children, and assign the **real parent's primary key** as the foreign key. This guarantees referential integrity by construction — never generate-then-repair.
+5. **Conditional generation** — condition child attributes on parent attributes (group-conditioned sampling) so cross-table correlations are preserved (e.g. premium-tier parents → higher child order values).
+6. **Enforce constraints** — apply arithmetic/conditional intra-row rules; enforce uniqueness; backfill circular FKs.
+7. **Semantic fill** — use Faker for `semantic` columns (names, emails, addresses, phones). Leave an interface where an LLM can replace Faker for higher realism later.
+
+Use **Pandas, NumPy, SciPy, Faker**. Reference SDV's hierarchical approach for the parent-child logic but implement it directly — keep the engine self-contained.
+
+---
+
+## STEP 3 — Validation & Fidelity Report. Build THIRD.
+
+In `backend/validation/`. Produces a report comparing generated data to its source (Replicator) or to the spec (Creator):
+
+- Per-column: distribution overlap via **KS test**, category-frequency match, range/format compliance.
+- Intra-table: correlation-matrix difference, constraint pass-rate (must be 100%).
+- Multi-table: referential integrity (must be 100%), cardinality-distribution match (children-per-parent KS test), cross-table correlation preservation.
+- Output a single **fidelity score (0–100)** plus the per-metric breakdown as JSON the frontend can chart.
+
+---
+
+## STEP 4 — Replicator Mode (data → spec). Build FOURTH.
+
+In `backend/replicator/`. Endpoint accepts an uploaded file and returns a spec:
+
+1. **Ingest** — detect encoding, delimiter, headers, types for CSV/XLSX/JSON.
+2. **Profile** each column — type, semantic type, null %, cardinality, distribution stats (mean/std/skew/range for numeric; frequencies for categorical), regex patterns for formatted strings.
+3. **Mine relationships** — correlations, functional dependencies, arithmetic rules.
+4. **Infer keys (multi-file)** — PK candidates = 100% unique + non-null; FK candidates = a column whose values are a near-subset of another table's PK with matching name/type. Build the schema graph.
+5. **Profile cardinality** — learn the children-per-parent distribution and store it in the relationship spec (this is the most important multi-table realism signal — it must be sampled, never fixed).
+6. **LLM semantic pass** — call the LLM (see LLM section) to label semantic types and write plain-language cross-table rules. Emit a complete spec.
+
+---
+
+## STEP 5 — Creator Mode (intent → spec). Build FIFTH.
+
+In `backend/creator/`. Endpoint accepts a natural-language query and returns a spec:
+
+1. **Parse intent with the LLM** — extract table count, columns, types, distributions, constraints, relationships, row counts.
+2. **Draft spec** — the LLM emits spec JSON (NOT data), inferring structural machinery the user didn't name explicitly (FKs, self-references, uniqueness, derived columns).
+3. **Gap-fill defaults** — for under-specified columns, apply sensible defaults (emails unique, ages 18–90) and include them in the spec so the user can review.
+4. **Detect conflicts** — run the spec through the engine's validator; if contradictory/impossible, return the conflict to the user instead of generating.
+
+Example to support: *"500 employees across 5 departments, salaries correlate with seniority, managers earn more than their reports, one manager per department"* → two tables, FK employees.dept_id → departments.id, salary↔seniority correlation, self-referential manager.salary > report.salary, cardinality = 1 manager/dept, inferred name/email/hire_date columns.
+
+---
+
+## STEP 6 — LLM Integration
+
+Add a thin LLM client in `backend/llm/`. Use the Anthropic API (read the key from an environment variable / Replit Secret named `ANTHROPIC_API_KEY` — never hardcode it). Two functions:
+- `parse_intent(query) -> spec_json` for Creator.
+- `semantic_pass(profile, sample_rows) -> semantic_labels + rules` for Replicator.
+
+Prompt the model to return **only valid JSON** matching the spec schema, and validate the response with Pydantic before use.
+
+---
+
+## STEP 7 — API (FastAPI)
+
+Persistent FastAPI server in `backend/main.py`. Endpoints:
+- `POST /replicate` — file upload → spec → generated tables + fidelity report.
+- `POST /create` — NL query → spec (returned for confirmation).
+- `POST /generate` — confirmed spec → generated tables + fidelity report.
+- `GET /download/{job_id}` — download generated tables as CSV/XLSX (zip if multiple).
+
+Long generations must run **async** (background task + job status polling) so requests don't block. Store uploads and outputs on disk; return download links.
+
+---
+
+## STEP 8 — Frontend (React + Vite + TS + Tailwind)
+
+In `frontend/`. Use **shadcn/ui** for components, **Recharts** for the fidelity charts, and **React Flow** for the schema graph. Screens:
+
+1. **Mode selector** — Replicator vs Creator.
+2. **Replicator** — drag-and-drop upload → show detected schema graph (React Flow) → let the user **confirm/edit** inferred keys and relationships before generating (key inference produces false positives — the user must be able to correct them).
+3. **Creator** — query textarea → show the **interpreted spec visually** for confirmation before generating ("here's what I understood"). Let the user edit it.
+4. **Results** — preview generated tables, show the **fidelity report** (score + KS-test/correlation charts + before/after distribution plots), and a download button.
+
+Keep the design clean, modern, and professional — this is a portfolio piece. Light/dark mode, responsive.
+
+---
+
+## V1 SCOPE (do this; defer the rest)
+
+**In v1:** types, ranges, uniqueness, categorical distributions, basic numeric correlation, single-table + simple two-table parent-child relationships, KS-test fidelity report, CSV/XLSX in & out, both modes with confirmation UIs.
+
+**Defer to v2 (leave clean interfaces, don't build yet):** deep multi-level hierarchies, many-to-many/junction tables, circular references, arbitrary cross-row conditional cascades, copula-based correlation, LLM-based semantic fill replacing Faker, hybrid seed-and-extend mode.
+
+---
+
+## NON-NEGOTIABLES
+
+- Build spec → engine → validation BEFORE the modes and UI. Test the engine with the hand-written example specs first.
+- Referential integrity must be 100% by construction (assign real parent keys), never repaired afterward.
+- Cardinality (children-per-parent) must be **sampled from a learned/specified distribution**, never a fixed or uniformly-random count.
+- The spec is the single contract between both modes and the engine — never write generation logic twice.
+- Read `ANTHROPIC_API_KEY` from Replit Secrets; never hardcode secrets.
+- Validate every LLM response against the Pydantic spec models before using it.
+
+Start with Step 1. Show me the Generation Spec models and example specs before moving to the engine.

@@ -1,0 +1,137 @@
+{
+  "version": "1.0",
+  "tables": [
+    {
+      "name": "customers",
+      "row_count": 500,
+      "primary_key": "customer_id",
+      "columns": [
+        {
+          "name": "customer_id",
+          "type": "integer",
+          "semantic_type": "id",
+          "generation": {"strategy": "sequential", "params": {"start": 1001, "step": 1}},
+          "constraints": {"unique": true, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "semantic_type": "name",
+          "generation": {"strategy": "semantic", "params": {"faker_method": "name"}},
+          "constraints": {"unique": false, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "email",
+          "type": "string",
+          "semantic_type": "email",
+          "generation": {"strategy": "semantic", "params": {"faker_method": "email"}},
+          "constraints": {"unique": true, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "tier",
+          "type": "categorical",
+          "semantic_type": "category",
+          "generation": {
+            "strategy": "categorical_sample",
+            "params": {"values": {"bronze": 0.5, "silver": 0.3, "gold": 0.15, "platinum": 0.05}}
+          },
+          "constraints": {"unique": false, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "signup_date",
+          "type": "datetime",
+          "semantic_type": "date",
+          "generation": {"strategy": "datetime_range", "params": {"start": "2019-01-01", "end": "2024-12-31", "format": "%Y-%m-%d"}},
+          "constraints": {"unique": false, "nullable": false, "min": null, "max": null}
+        }
+      ],
+      "intra_row_constraints": []
+    },
+    {
+      "name": "orders",
+      "row_count": 2000,
+      "primary_key": "order_id",
+      "columns": [
+        {
+          "name": "order_id",
+          "type": "integer",
+          "semantic_type": "id",
+          "generation": {"strategy": "sequential", "params": {"start": 10001, "step": 1}},
+          "constraints": {"unique": true, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "customer_id",
+          "type": "integer",
+          "semantic_type": "id",
+          "generation": {"strategy": "foreign_key", "params": {"references_table": "customers", "references_column": "customer_id"}},
+          "constraints": {"unique": false, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "order_date",
+          "type": "datetime",
+          "semantic_type": "date",
+          "generation": {"strategy": "datetime_range", "params": {"start": "2020-01-01", "end": "2024-12-31", "format": "%Y-%m-%d"}},
+          "constraints": {"unique": false, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "status",
+          "type": "categorical",
+          "semantic_type": "category",
+          "generation": {
+            "strategy": "categorical_sample",
+            "params": {"values": {"pending": 0.1, "processing": 0.15, "shipped": 0.25, "delivered": 0.45, "cancelled": 0.05}}
+          },
+          "constraints": {"unique": false, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "qty",
+          "type": "integer",
+          "semantic_type": "none",
+          "generation": {"strategy": "numeric_distribution", "params": {"dist": "uniform", "low": 1, "high": 10}},
+          "constraints": {"unique": false, "nullable": false, "min": 1, "max": 100}
+        },
+        {
+          "name": "unit_price",
+          "type": "float",
+          "semantic_type": "currency",
+          "generation": {"strategy": "numeric_distribution", "params": {"dist": "lognormal", "mean": 3.5, "std": 1.0}},
+          "constraints": {"unique": false, "nullable": false, "min": 1.0, "max": 500.0}
+        },
+        {
+          "name": "total",
+          "type": "float",
+          "semantic_type": "currency",
+          "generation": {"strategy": "derived", "params": {"expression": "qty * unit_price"}},
+          "constraints": {"unique": false, "nullable": false, "min": 1.0, "max": null}
+        }
+      ],
+      "intra_row_constraints": [
+        {"type": "arithmetic", "rule": "total = qty * unit_price"}
+      ]
+    }
+  ],
+  "relationships": [
+    {
+      "parent": "customers",
+      "child": "orders",
+      "parent_key": "customer_id",
+      "child_key": "customer_id",
+      "cardinality": {
+        "distribution": "poisson",
+        "params": {"mu": 4.0},
+        "min_children": 0,
+        "max_children": null
+      },
+      "participation": 0.9,
+      "conditional_correlations": [
+        {
+          "parent_column": "tier",
+          "child_column": "unit_price",
+          "type": "shift",
+          "params": {}
+        }
+      ],
+      "temporal": null
+    }
+  ]
+}

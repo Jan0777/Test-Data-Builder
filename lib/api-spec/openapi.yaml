@@ -1,22 +1,30 @@
 openapi: 3.1.0
 info:
-  # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Synthetic Data Studio API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: replicate
+    description: Replicator mode - learn from uploaded data
+  - name: create
+    description: Creator mode - generate from natural language
+  - name: generate
+    description: Generation engine - run a confirmed spec
+  - name: jobs
+    description: Job status and management
+  - name: download
+    description: Download generated results
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,6 +32,173 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /replicate:
+    post:
+      operationId: replicateFile
+      tags: [replicate]
+      summary: Upload a data file and profile it into a Generation Spec
+      responses:
+        "202":
+          description: Job accepted, use job_id to poll status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobAccepted"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /create:
+    post:
+      operationId: createFromQuery
+      tags: [create]
+      summary: Convert natural-language query into a Generation Spec for confirmation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatorQuery"
+      responses:
+        "200":
+          description: Parsed spec ready for user confirmation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpecPreview"
+        "400":
+          description: Conflict or impossible spec
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConflictResponse"
+
+  /generate:
+    post:
+      operationId: generateFromSpec
+      tags: [generate]
+      summary: Run the generation engine on a confirmed spec
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateInput"
+      responses:
+        "202":
+          description: Generation job accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobAccepted"
+        "400":
+          description: Invalid or impossible spec
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConflictResponse"
+
+  /jobs/{jobId}:
+    get:
+      operationId: getJobStatus
+      tags: [jobs]
+      summary: Poll job status
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobStatus"
+        "404":
+          description: Job not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /jobs:
+    get:
+      operationId: listJobs
+      tags: [jobs]
+      summary: List recent jobs
+      responses:
+        "200":
+          description: List of recent jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/JobSummary"
+
+  /download/{jobId}/{format}:
+    get:
+      operationId: downloadResults
+      tags: [download]
+      summary: Download generated tables as CSV or XLSX zip
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [csv, xlsx]
+      responses:
+        "200":
+          description: Zip archive of generated tables
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Job not found or not complete
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /spec/{jobId}:
+    get:
+      operationId: getJobSpec
+      tags: [jobs]
+      summary: Get the Generation Spec for a completed replicate job
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The Generation Spec JSON
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenerationSpec"
+        "404":
+          description: Job not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +209,369 @@ components:
       required:
         - status
 
+    CreatorQuery:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Natural language description of the tables to generate
+        row_count:
+          type: ["integer", "null"]
+          description: Default row count for tables if not specified in query
+      required:
+        - query
+
+    GenerateInput:
+      type: object
+      properties:
+        spec:
+          $ref: "#/components/schemas/GenerationSpec"
+        format:
+          type: string
+          enum: [csv, xlsx]
+          default: csv
+      required:
+        - spec
+
+    JobAccepted:
+      type: object
+      properties:
+        job_id:
+          type: string
+        status:
+          type: string
+        message:
+          type: string
+      required:
+        - job_id
+        - status
+
+    JobStatus:
+      type: object
+      properties:
+        job_id:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, complete, failed]
+        progress:
+          type: ["number", "null"]
+          description: 0-100 progress percentage
+        message:
+          type: ["string", "null"]
+        result:
+          $ref: "#/components/schemas/GenerationResult"
+        error:
+          type: ["string", "null"]
+        created_at:
+          type: string
+        updated_at:
+          type: string
+        mode:
+          type: string
+          enum: [replicate, create, generate]
+        spec:
+          $ref: "#/components/schemas/GenerationSpec"
+      required:
+        - job_id
+        - status
+        - created_at
+        - updated_at
+        - mode
+
+    JobSummary:
+      type: object
+      properties:
+        job_id:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, complete, failed]
+        mode:
+          type: string
+          enum: [replicate, create, generate]
+        created_at:
+          type: string
+        updated_at:
+          type: string
+        row_count:
+          type: ["integer", "null"]
+        table_count:
+          type: ["integer", "null"]
+        filename:
+          type: ["string", "null"]
+      required:
+        - job_id
+        - status
+        - mode
+        - created_at
+        - updated_at
+
+    SpecPreview:
+      type: object
+      properties:
+        spec:
+          $ref: "#/components/schemas/GenerationSpec"
+        summary:
+          type: string
+          description: Human-readable summary of what was interpreted
+        conflicts:
+          type: array
+          items:
+            type: string
+          description: Any warnings or ambiguities detected
+      required:
+        - spec
+        - summary
+        - conflicts
+
+    ConflictResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        conflicts:
+          type: array
+          items:
+            type: string
+      required:
+        - error
+        - conflicts
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+
+    GenerationResult:
+      type: object
+      properties:
+        tables:
+          type: array
+          items:
+            $ref: "#/components/schemas/TableResult"
+        fidelity_report:
+          $ref: "#/components/schemas/FidelityReport"
+        download_url:
+          type: string
+        row_count_total:
+          type: integer
+      required:
+        - tables
+        - fidelity_report
+
+    TableResult:
+      type: object
+      properties:
+        name:
+          type: string
+        row_count:
+          type: integer
+        columns:
+          type: array
+          items:
+            type: string
+        preview:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: First 10 rows as JSON
+      required:
+        - name
+        - row_count
+        - columns
+        - preview
+
+    FidelityReport:
+      type: object
+      properties:
+        overall_score:
+          type: number
+          description: 0-100 overall fidelity score
+        per_table:
+          type: array
+          items:
+            $ref: "#/components/schemas/TableFidelity"
+        referential_integrity:
+          type: number
+          description: 0-100 referential integrity score
+        constraint_pass_rate:
+          type: number
+          description: 0-100 constraint satisfaction rate
+      required:
+        - overall_score
+        - per_table
+
+    TableFidelity:
+      type: object
+      properties:
+        table_name:
+          type: string
+        per_column:
+          type: array
+          items:
+            $ref: "#/components/schemas/ColumnFidelity"
+        correlation_delta:
+          type: ["number", "null"]
+          description: Max absolute correlation matrix difference
+        constraint_pass_rate:
+          type: number
+      required:
+        - table_name
+        - per_column
+        - constraint_pass_rate
+
+    ColumnFidelity:
+      type: object
+      properties:
+        column_name:
+          type: string
+        ks_statistic:
+          type: ["number", "null"]
+          description: KS test statistic (lower = better match)
+        ks_pvalue:
+          type: ["number", "null"]
+        category_overlap:
+          type: ["number", "null"]
+          description: 0-1 category frequency match (for categoricals)
+        range_compliance:
+          type: number
+          description: 0-1 fraction within valid range
+        null_rate_actual:
+          type: ["number", "null"]
+        null_rate_expected:
+          type: ["number", "null"]
+      required:
+        - column_name
+        - range_compliance
+
+    GenerationSpec:
+      type: object
+      properties:
+        version:
+          type: string
+        tables:
+          type: array
+          items:
+            $ref: "#/components/schemas/TableSpec"
+        relationships:
+          type: array
+          items:
+            $ref: "#/components/schemas/RelationshipSpec"
+      required:
+        - version
+        - tables
+        - relationships
+
+    TableSpec:
+      type: object
+      properties:
+        name:
+          type: string
+        row_count:
+          type: integer
+        primary_key:
+          type: ["string", "null"]
+        columns:
+          type: array
+          items:
+            $ref: "#/components/schemas/ColumnSpec"
+        intra_row_constraints:
+          type: array
+          items:
+            $ref: "#/components/schemas/IntraRowConstraint"
+      required:
+        - name
+        - row_count
+        - columns
+        - intra_row_constraints
+
+    ColumnSpec:
+      type: object
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum: [integer, float, string, categorical, datetime, boolean]
+        semantic_type:
+          type: string
+          enum: [id, name, email, address, currency, category, date, phone, none]
+        generation:
+          type: object
+          additionalProperties: true
+          description: Generation strategy object
+        constraints:
+          $ref: "#/components/schemas/ColumnConstraints"
+      required:
+        - name
+        - type
+        - semantic_type
+        - generation
+        - constraints
+
+    ColumnConstraints:
+      type: object
+      properties:
+        unique:
+          type: boolean
+        nullable:
+          type: boolean
+        min:
+          type: ["number", "null"]
+        max:
+          type: ["number", "null"]
+      required:
+        - unique
+        - nullable
+
+    IntraRowConstraint:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [arithmetic, conditional]
+        rule:
+          type: string
+      required:
+        - type
+        - rule
+
+    RelationshipSpec:
+      type: object
+      properties:
+        parent:
+          type: string
+        child:
+          type: string
+        parent_key:
+          type: string
+        child_key:
+          type: string
+        cardinality:
+          type: object
+          additionalProperties: true
+          description: Distribution + params for children-per-parent count
+        participation:
+          type: number
+          description: Fraction of parents with at least one child (0-1)
+        conditional_correlations:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        temporal:
+          type: ["object", "null"]
+          additionalProperties: true
+      required:
+        - parent
+        - child
+        - parent_key
+        - child_key
+        - cardinality
+        - participation
+        - conditional_correlations

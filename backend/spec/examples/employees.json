@@ -1,0 +1,131 @@
+{
+  "version": "1.0",
+  "tables": [
+    {
+      "name": "departments",
+      "row_count": 5,
+      "primary_key": "dept_id",
+      "columns": [
+        {
+          "name": "dept_id",
+          "type": "integer",
+          "semantic_type": "id",
+          "generation": {"strategy": "sequential", "params": {"start": 1, "step": 1}},
+          "constraints": {"unique": true, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "dept_name",
+          "type": "categorical",
+          "semantic_type": "category",
+          "generation": {
+            "strategy": "categorical_sample",
+            "params": {"values": {"Engineering": 0.2, "Sales": 0.2, "Marketing": 0.2, "HR": 0.2, "Finance": 0.2}}
+          },
+          "constraints": {"unique": true, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "budget",
+          "type": "float",
+          "semantic_type": "currency",
+          "generation": {"strategy": "numeric_distribution", "params": {"dist": "uniform", "low": 500000, "high": 2000000}},
+          "constraints": {"unique": false, "nullable": false, "min": 100000, "max": 5000000}
+        }
+      ],
+      "intra_row_constraints": []
+    },
+    {
+      "name": "employees",
+      "row_count": 500,
+      "primary_key": "employee_id",
+      "columns": [
+        {
+          "name": "employee_id",
+          "type": "integer",
+          "semantic_type": "id",
+          "generation": {"strategy": "sequential", "params": {"start": 1, "step": 1}},
+          "constraints": {"unique": true, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "dept_id",
+          "type": "integer",
+          "semantic_type": "id",
+          "generation": {"strategy": "foreign_key", "params": {"references_table": "departments", "references_column": "dept_id"}},
+          "constraints": {"unique": false, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "semantic_type": "name",
+          "generation": {"strategy": "semantic", "params": {"faker_method": "name"}},
+          "constraints": {"unique": false, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "email",
+          "type": "string",
+          "semantic_type": "email",
+          "generation": {"strategy": "semantic", "params": {"faker_method": "company_email"}},
+          "constraints": {"unique": true, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "hire_date",
+          "type": "datetime",
+          "semantic_type": "date",
+          "generation": {"strategy": "datetime_range", "params": {"start": "2010-01-01", "end": "2024-12-31", "format": "%Y-%m-%d"}},
+          "constraints": {"unique": false, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "seniority",
+          "type": "categorical",
+          "semantic_type": "category",
+          "generation": {
+            "strategy": "categorical_sample",
+            "params": {"values": {"junior": 0.4, "mid": 0.35, "senior": 0.2, "lead": 0.05}}
+          },
+          "constraints": {"unique": false, "nullable": false, "min": null, "max": null}
+        },
+        {
+          "name": "salary",
+          "type": "float",
+          "semantic_type": "currency",
+          "generation": {"strategy": "numeric_distribution", "params": {"dist": "skewnormal", "mean": 75000, "std": 25000, "a": 2.0}},
+          "constraints": {"unique": false, "nullable": false, "min": 40000, "max": 300000}
+        },
+        {
+          "name": "is_manager",
+          "type": "boolean",
+          "semantic_type": "none",
+          "generation": {
+            "strategy": "categorical_sample",
+            "params": {"values": {"true": 0.1, "false": 0.9}}
+          },
+          "constraints": {"unique": false, "nullable": false, "min": null, "max": null}
+        }
+      ],
+      "intra_row_constraints": []
+    }
+  ],
+  "relationships": [
+    {
+      "parent": "departments",
+      "child": "employees",
+      "parent_key": "dept_id",
+      "child_key": "dept_id",
+      "cardinality": {
+        "distribution": "uniform",
+        "params": {"low": 80, "high": 120},
+        "min_children": 1,
+        "max_children": null
+      },
+      "participation": 1.0,
+      "conditional_correlations": [
+        {
+          "parent_column": "budget",
+          "child_column": "salary",
+          "type": "shift",
+          "params": {}
+        }
+      ],
+      "temporal": null
+    }
+  ]
+}

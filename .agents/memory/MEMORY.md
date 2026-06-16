@@ -1,0 +1,3 @@
+- [Python backend path](python-backend-path.md) — uvicorn runs from artifact dir; must cd to workspace root first or `backend` module won't resolve
+- [Column type system](column-type-system.md) — ColumnSpec.type is strict literal; semantic intent goes in semantic_type field, not type
+- [File upload pattern](file-upload-pattern.md) — multipart uploads bypass Orval hooks; use raw fetch + FormData in the page component
