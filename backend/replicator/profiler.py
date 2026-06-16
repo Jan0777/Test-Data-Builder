@@ -262,45 +262,153 @@ def _infer_relationships(
     frames: Dict[str, pd.DataFrame],
     table_specs: Dict[str, "TableSpec"],
 ) -> List[RelationshipSpec]:
+    """
+    Two-strategy relationship detection:
+    1. Exact column-name match: if a column in the child table has the SAME name as a PK
+       in another table, treat it as a FK (validated by value overlap ≥ 0.5).
+    2. Name-heuristic fallback: strip _id suffix and look for substring match between
+       the column base and the parent table name (overlap threshold ≥ 0.85).
+    """
     rels = []
     table_names = list(frames.keys())
+    seen: set = set()
 
-    pks: Dict[str, Tuple[str, "pd.Series"]] = {}
+    # Index PKs by column name for O(1) exact-match lookup
+    pks_by_col: Dict[str, List[Tuple[str, set]]] = {}
+    pk_of_table: Dict[str, Optional[str]] = {}
     for tname in table_names:
         ts = table_specs[tname]
+        pk_of_table[tname] = ts.primary_key
         if ts.primary_key:
-            pks[tname] = (ts.primary_key, frames[tname][ts.primary_key])
+            col = ts.primary_key
+            if col not in pks_by_col:
+                pks_by_col[col] = []
+            # Sample for large tables to keep overlap check fast
+            pk_series = frames[tname][col].dropna()
+            if len(pk_series) > 50_000:
+                pk_series = pk_series.sample(50_000, random_state=42)
+            pks_by_col[col].append((tname, set(pk_series.tolist())))
+
+    # ── Strategy 0: shared-PK / 1:1 relationships ────────────────────────────
+    # When two tables share the same PK column name, the one whose PK values are
+    # a strict subset of the other's is the child (identifying relationship).
+    pk_names = list(pks_by_col.keys())
+    for pk_col in pk_names:
+        entries = pks_by_col[pk_col]
+        if len(entries) < 2:
+            continue
+        for i in range(len(entries)):
+            for j in range(len(entries)):
+                if i == j:
+                    continue
+                p_name, p_set = entries[i]
+                c_name, c_set = entries[j]
+                key = (p_name, c_name, pk_col)
+                if key in seen:
+                    continue
+                # Child's PK values must be a subset (or equal) of parent's
+                if not c_set.issubset(p_set) and not c_set == p_set:
+                    continue
+                # Avoid adding both directions when sets are equal — pick by table name order
+                rev_key = (c_name, p_name, pk_col)
+                if c_set == p_set and rev_key in seen:
+                    continue
+                child_vals = frames[c_name][pk_col].dropna()
+                card = _profile_cardinality(p_set, child_vals)
+                participation = min(1.0, float(len(c_set) / max(len(p_set), 1)))
+                rels.append(RelationshipSpec(
+                    parent=p_name,
+                    child=c_name,
+                    parent_key=pk_col,
+                    child_key=pk_col,
+                    cardinality=card,
+                    participation=round(participation, 4),
+                    conditional_correlations=[],
+                    temporal=None,
+                ))
+                seen.add(key)
 
     for child_name, child_df in frames.items():
-        for col in child_df.columns:
-            if not (col.endswith("_id") or col.endswith("id")):
+        child_pk = pk_of_table.get(child_name)
+
+        for child_col in child_df.columns:
+            # Skip the child's own PK — handled by Strategy 0 above
+            if child_col == child_pk:
                 continue
-            for parent_name, (pk_col, pk_series) in pks.items():
+
+            child_vals = child_df[child_col].dropna()
+            if len(child_vals) == 0:
+                continue
+            # Sample for overlap check on large frames
+            sample_vals = child_vals if len(child_vals) <= 50_000 else child_vals.sample(50_000, random_state=42)
+
+            # ── Strategy 1: exact column-name match ──────────────────────────
+            if child_col in pks_by_col:
+                for parent_name, parent_pk_set in pks_by_col[child_col]:
+                    if parent_name == child_name:
+                        continue
+                    key = (parent_name, child_name, child_col)
+                    if key in seen:
+                        continue
+                    overlap = sample_vals.isin(parent_pk_set).mean()
+                    if overlap >= 0.5:
+                        card = _profile_cardinality(parent_pk_set, child_vals)
+                        participation = min(1.0, float(child_vals.nunique() / max(len(parent_pk_set), 1)))
+                        rels.append(RelationshipSpec(
+                            parent=parent_name,
+                            child=child_name,
+                            parent_key=child_col,
+                            child_key=child_col,
+                            cardinality=card,
+                            participation=round(participation, 4),
+                            conditional_correlations=[],
+                            temporal=None,
+                        ))
+                        seen.add(key)
+                # Already handled by exact match — skip heuristic for this column
+                continue
+
+            # ── Strategy 2: name-heuristic (_id suffix) ──────────────────────
+            if not (child_col.endswith("_id") or (child_col.endswith("id") and len(child_col) > 2)):
+                continue
+
+            # Strip trailing _id / id and normalise
+            col_base = re.sub(r"[_]?id$", "", child_col, flags=re.IGNORECASE).lower().strip("_")
+            col_norm = re.sub(r"[_\-\s]+", "", col_base)
+
+            for parent_name in table_names:
                 if parent_name == child_name:
                     continue
-                col_clean = col.replace("_id", "").replace("id", "")
-                parent_clean = parent_name.lower()
-                if not (col_clean in parent_clean or parent_clean in col_clean):
+                parent_pk = pk_of_table.get(parent_name)
+                if not parent_pk:
                     continue
-                child_vals = child_df[col].dropna()
-                parent_vals = set(pk_series.tolist())
-                if len(child_vals) == 0:
+                key = (parent_name, child_name, child_col)
+                if key in seen:
                     continue
-                overlap = child_vals.isin(parent_vals).mean()
-                if overlap >= 0.85:
-                    card = _profile_cardinality(parent_vals, child_df[col].dropna())
-                    participation = float(len(child_df[col].dropna().unique()) / max(len(parent_vals), 1))
-                    participation = min(1.0, participation)
-                    rels.append(RelationshipSpec(
-                        parent=parent_name,
-                        child=child_name,
-                        parent_key=pk_col,
-                        child_key=col,
-                        cardinality=card,
-                        participation=round(participation, 4),
-                        conditional_correlations=[],
-                        temporal=None,
-                    ))
+
+                parent_norm = re.sub(r"[_\-\s]+", "", parent_name.lower())
+                if not (col_norm in parent_norm or parent_norm in col_norm):
+                    continue
+
+                parent_pk_set = pks_by_col.get(parent_pk, [])
+                for pname, pset in parent_pk_set:
+                    if pname != parent_name:
+                        continue
+                    overlap = sample_vals.isin(pset).mean()
+                    if overlap >= 0.85:
+                        card = _profile_cardinality(pset, child_vals)
+                        participation = min(1.0, float(child_vals.nunique() / max(len(pset), 1)))
+                        rels.append(RelationshipSpec(
+                            parent=parent_name,
+                            child=child_name,
+                            parent_key=parent_pk,
+                            child_key=child_col,
+                            cardinality=card,
+                            participation=round(participation, 4),
+                            conditional_correlations=[],
+                            temporal=None,
+                        ))
+                        seen.add(key)
 
     return rels
 
