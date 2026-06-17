@@ -1,3 +1,2 @@
-- [Python backend path](python-backend-path.md) — uvicorn runs from artifact dir; must cd to workspace root first or `backend` module won't resolve
-- [Column type system](column-type-system.md) — ColumnSpec.type is strict literal; semantic intent goes in semantic_type field, not type
-- [File upload pattern](file-upload-pattern.md) — multipart uploads bypass Orval hooks; use raw fetch + FormData in the page component
+- [Replicator empirical engine](replicator-empirical-engine.md) — cardinality check must run BEFORE semantic sniffing; Cramér's V needs raw counts + scipy.chi2_contingency, not normalize=True
+- [Pattern learner quality gates](pattern-learner-gates.md) — learned_pattern needs length ≤40 + 15% genuinely-varied positions to exclude natural language text; validator uses theoretical alphabet sizes (A=26,#=10,?=36)

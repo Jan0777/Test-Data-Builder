@@ -1,0 +1,350 @@
+# PROMPT 1 — Replicator Realism Overhaul (Empirical + Joint-Distribution Engine)
+
+## CONTEXT — READ BEFORE CODING
+
+You are working inside the existing **Synthetic Data Studio / Test-Data-Builder** project. The
+Python backend already exists at `backend/` with this structure and these files, and you MUST
+preserve their public contracts:
+
+```
+backend/
+  spec/models.py          # Pydantic: GenerationSpec, TableSpec, ColumnSpec, ColumnConstraints,
+                          #   IntraRowConstraint, CardinalitySpec, ConditionalCorrelation,
+                          #   RelationshipSpec, SpecConflict, ValidationResult
+  engine/
+    generator.py          # generate(spec, progress_cb) -> Dict[str, DataFrame]
+    topological.py        # topological_sort, get_parent_relationships, get_child_relationships
+    validator.py          # validate_spec(spec) -> ValidationResult
+  replicator/
+    ingest.py             # ingest_file(path, filename) -> Dict[str, DataFrame]
+    profiler.py           # profile_to_spec(frames, semantic_labels, row_count_override) -> GenerationSpec
+  validation/report.py    # generate_report(generated, spec, source) -> dict
+  creator/parser.py
+  llm/client.py
+```
+
+The pipeline is: **REPLICATOR (profile file) → GENERATION SPEC (JSON) → ENGINE → tables → VALIDATION.**
+Both modes (Replicator, Creator) emit the same `GenerationSpec`. Referential integrity is
+guaranteed by construction (real parent keys assigned to children). Do not break any of that.
+
+## THE PROBLEM YOU ARE FIXING
+
+The current Replicator is **lossy and parametric**. It profiles each column independently, fits a
+single textbook distribution (one normal/lognormal/skewnormal with one mean + one std), and
+re-samples each column in isolation. As a result the generated data is NOT realistic:
+
+1. **Smooth-curve smear.** Real columns are multimodal, spiky, zero-inflated, bounded, or
+   rounded (prices ending .99, ages clustering on round numbers, salaries clustering by band).
+   Fitting mean+std+skew destroys all of that.
+2. **No column-to-column correlation.** Columns are sampled in an independent loop, so
+   `age↔income`, `country→currency`, `tier→spend` relationships are destroyed → impossible rows.
+3. **High-cardinality text becomes random Faker words.** Anything not matched by a column-NAME
+   keyword falls through to `faker_method:"word"`. Product names, SKUs, titles, descriptions
+   become gibberish like "blue", "method".
+4. **Semantic records are internally inconsistent.** city/state/zip/country and
+   first_name/last_name/email are independent Faker calls → "Paris, Texas, 90210, Germany" and
+   `john.smith@x.com` on a row named "Maria Garcia".
+5. **Pattern/ID structure mangled.** `_regex_to_bothify` lossily maps `\d→#`, `\w→?`; real code
+   masks like `ABC-1234-XY` don't survive, and no pattern is learned from the source at all.
+6. **Datetimes lose temporal structure.** `datetime_range` samples uniformly between min/max —
+   erasing weekday/weekend cycles, business hours, seasonality, trends, gaps.
+7. **Constraint enforcement corrupts distributions.** Out-of-range values are clamped with
+   `np.maximum`/`np.minimum`, piling probability mass on the exact min/max edges; uniqueness
+   repair (`_1`, `+counter*0.001`) dents the distribution and can re-violate the range.
+8. **Cross-table conditional correlations are never learned** (profiler always sets
+   `conditional_correlations=[]`) and the engine only does a crude 0.5× mean-shift.
+
+## YOUR MANDATE
+
+Re-architect the **Replicator profiling + engine sampling** so that, for ANY uploaded table or
+set of tables (1 or many tables, 1 or 100+ columns each), the system **learns the real empirical
+marginal AND joint distributions** and **recreates data that is statistically near-identical** to
+the source — verified percentile-by-percentile and by correlation matrix, not by a single summary
+statistic.
+
+This is an **empirical-first** redesign. The guiding principle:
+
+> **Do not fit textbook distributions to real data. Capture the real data's own shape and
+> dependencies, then resample from THAT.**
+
+Crucially, this MUST be **backward compatible**: extend the spec with new optional fields and new
+generation strategies; do not remove or rename existing ones. Every existing example spec and the
+Creator mode must keep working unchanged.
+
+---
+
+## PART A — EXTEND THE SPEC (backend/spec/models.py)
+
+Add new, **optional** structures. Do not change existing field names or defaults.
+
+1. **New column generation strategies** (these are values of `generation["strategy"]`, carried in
+   the existing `generation: Dict[str,Any]`, so no model change is strictly required — but ADD a
+   documented constant list `KNOWN_STRATEGIES` to the module):
+   - `"empirical_sample"` — bootstrap/inverse-CDF sampling from stored empirical data.
+     `params`: `{ "quantiles": [101 floats], "values": [...], "probabilities": [...],
+     "is_integer": bool, "round_decimals": int|null, "value_multiplicity": {...optional...} }`
+   - `"empirical_categorical"` — full observed value→probability map (NOT truncated to 50),
+     with an `"_other_"` bucket for the long tail. `params`: `{ "values": {cat: prob},
+     "preserve_order": bool }`
+   - `"copula_member"` — marks a column as part of a table-level Gaussian-copula block; the actual
+     sampling is driven by a new table-level `joint_model` (see below). `params`:
+     `{ "marginal": {...empirical marginal as above...} }`
+   - `"learned_pattern"` — a format mask learned from the source. `params`:
+     `{ "mask": "AAA-####-AA", "alphabets": {...}, "examples": [...], "preserve_prefixes": bool }`
+   - `"empirical_datetime"` — datetime sampling that preserves temporal structure. `params`:
+     `{ "anchor_start": iso, "anchor_end": iso, "dow_weights":[7], "hour_weights":[24],
+     "month_weights":[12], "trend": "none|linear", "granularity":"day|hour|minute|second",
+     "format": "...", "bootstrap_pool":[...optional real timestamps...] }`
+   - `"semantic_record"` — locale-consistent multi-field semantic generation (see Part D).
+
+2. **New optional field on `ColumnSpec`:**
+   ```python
+   empirical: Optional[Dict[str, Any]] = None   # raw learned profile payload (marginal, nulls,
+                                                 # rounding, observed-value pool reference, etc.)
+   ```
+
+3. **New optional field on `TableSpec`:**
+   ```python
+   joint_model: Optional[Dict[str, Any]] = None
+   # {
+   #   "type": "gaussian_copula",
+   #   "columns": [col names included in the copula],
+   #   "correlation_matrix": [[...]],          # Spearman/rank correlation, PSD-corrected
+   #   "conditional_groups": [                 # group-conditional sampling keys
+   #       { "by": ["country"], "targets": ["currency","region"] },
+   #       { "by": ["tier"],    "targets": ["spend","orders"] }
+   #   ]
+   # }
+   ```
+
+4. **New optional field on `RelationshipSpec`:** keep `conditional_correlations` but allow it to be
+   populated by the profiler. Add:
+   ```python
+   parent_conditioning: Optional[Dict[str, Any]] = None
+   # { "parent_columns": [...], "child_targets": [...], "method": "group_empirical" }
+   ```
+
+5. Re-export the **JSON Schema** so the frontend keeps validating specs. Bump `GenerationSpec`
+   default `version` documentation to note the empirical extensions (keep accepting "1.0").
+
+Add Pydantic validators that tolerate these being absent (older specs) — never raise on missing.
+
+---
+
+## PART B — REWRITE THE PROFILER (backend/replicator/profiler.py)
+
+The profiler is now an **empirical learner**, not a parametric fitter. Implement a deterministic,
+well-logged pipeline. For EACH table:
+
+### B1. Per-column empirical marginal (replaces `_infer_generation` parametric fits)
+For every column, regardless of type, learn and store the column's OWN shape:
+
+- **Numeric (int/float):**
+  - Store a **101-point quantile grid** (0th…100th percentile, i.e. `np.quantile(x, np.linspace(0,1,101))`).
+    This is the empirical inverse-CDF and is the single most important realism artifact.
+  - Detect and store: integer-ness, **rounding granularity** (e.g. multiples of 5, 100, or 0.99
+    endings — infer the modal decimal pattern), **zero-inflation rate**, min/max, and whether the
+    column is **bounded** (hard limits) vs unbounded.
+  - Detect **multimodality** (e.g. via a simple KDE or histogram peak count) and record it so the
+    sampler does not smooth it away. The empirical quantile sampler handles this for free, but flag it.
+  - Strategy → `"empirical_sample"` (or `"copula_member"` if it joins the joint model — see B4).
+- **Categorical / low-cardinality / boolean:**
+  - Store the **full** value→probability map (do NOT cap at 50). For very high cardinality, keep the
+    top-N that cover ~99% of mass and fold the remainder into `"_other_"` with its aggregate prob
+    AND a sampling pool so `_other_` values are drawn from real tail values, not a literal "_other_".
+  - Preserve observed category co-occurrence for use in B4 conditional groups.
+  - Strategy → `"empirical_categorical"`.
+- **Datetime:**
+  - Parse robustly. Learn day-of-week weights, hour weights, month weights, overall
+    start/end anchors, and detect linear trend (counts rising/falling over time). Optionally keep a
+    bootstrap pool of real timestamps for highest fidelity.
+  - Strategy → `"empirical_datetime"`.
+- **String / text:**
+  - First try **content sniffing** (NOT name-only): does the column's VALUES look like emails,
+    phones, URLs, UUIDs, IDs, names, addresses? Use regex + a sample-based heuristic. Only if the
+    content matches a semantic type do you assign a semantic generator.
+  - If the column is a structured **code/ID** (consistent length + character classes), learn a
+    **format mask** (see B3) → strategy `"learned_pattern"`.
+  - If it is free text with repetition, treat as `"empirical_categorical"` (sample real observed
+    strings by frequency) rather than Faker words. **Faker `word` is the last resort only.**
+
+Always learn and store the **null rate** exactly (per column) and reproduce it (do not silently
+fill). Store `unique` and PK detection as today.
+
+### B2. Preserve PK / sequential / FK behavior
+Keep current PK detection. Integer PKs stay `"sequential"`. FK columns stay handled by the engine's
+child-table path. Do not let empirical sampling clobber keys.
+
+### B3. Learn format masks for codes/IDs (`learned_pattern`)
+From a sample of values, derive a mask where `A`=letter, `#`=digit, literals preserved
+(`-`, `/`, space). Record per-position alphabets actually observed (e.g. position 0 ∈ {A,B,C}),
+common prefixes/suffixes, and length distribution. The engine regenerates by filling the mask from
+the observed per-position alphabets — so `ABC-1234-XY` style stays intact.
+
+### B4. Learn the JOINT distribution (the realism centerpiece) → `TableSpec.joint_model`
+This is what makes rows internally consistent. For each table with ≥2 correlated columns:
+
+- **Numeric–numeric correlation:** compute the **Spearman (rank) correlation matrix** across all
+  numeric (and ordinal-categorical) columns. Make it **positive semi-definite** (eigenvalue clip /
+  nearest-PSD). Store under `joint_model.correlation_matrix` with the participating `columns`.
+  These columns get strategy `"copula_member"` carrying their empirical marginal.
+- **Categorical → anything conditional groups:** for low-cardinality categorical columns that
+  strongly determine other columns (detect via conditional distribution divergence, e.g. group a
+  target by the category and measure how much its distribution shifts — use a simple effect-size /
+  mutual-information style score), record a `conditional_groups` entry `{ "by":[cat], "targets":[...] }`.
+  At generation, targets are sampled **within each category group from that group's own empirical
+  marginal** — so country→currency, tier→spend stay consistent.
+- Prefer the **copula** for numeric bundles and **group-conditional empirical** for
+  categorical-driven dependencies. A column can be in both (copula for its numeric correlation,
+  group membership for its categorical driver) — document precedence (group conditioning first,
+  then copula residual).
+
+### B5. Learn intra-row arithmetic constraints (improve `_infer_arithmetic_constraints`)
+Keep the product-correlation detector but generalize: also detect `a = b + c`, `a = b - c`,
+`a = b / c`, and ratio/identity relationships with a tolerance test on actual rows
+(`np.allclose` on a sample). Emit them as `IntraRowConstraint(type="arithmetic", rule=...)` so the
+engine recomputes them post-sampling (guaranteeing they hold exactly).
+
+### B6. Learn cross-table conditional correlation → populate `RelationshipSpec`
+When relationships are detected (keep the existing two-strategy detector), ALSO learn, per
+relationship, how child attributes shift with parent attributes: group children by their parent
+row's key attributes and store the per-group child marginals into
+`relationship.parent_conditioning` (`method:"group_empirical"`) and/or
+`conditional_correlations`. This replaces the unused 0.5× mean-shift.
+
+### B7. Storage of empirical payloads
+Empirical artifacts (quantile grids, value pools, timestamp pools) can be large. Store them
+**inside the spec** when small, or write a sidecar artifact (e.g. `profile_artifacts/<table>.parquet`
+/ JSON) referenced by ID from the spec, so the spec JSON stays serializable for the frontend.
+Pick one approach and implement it cleanly with a documented size threshold. The engine must be
+able to resolve the reference and load the pool.
+
+---
+
+## PART C — REWRITE THE ENGINE SAMPLERS (backend/engine/generator.py)
+
+Add handlers for the new strategies. Keep the existing ones. Keep FK-by-construction, topological
+order, constraint enforcement, and the `progress_cb` contract.
+
+### C1. `empirical_sample` (numeric inverse-CDF)
+Sample `u ~ Uniform(0,1)`, map through the stored 101-point quantile grid via **linear
+interpolation** (`np.interp(u, np.linspace(0,1,101), quantiles)`). Then:
+- Re-apply **rounding granularity** (round to the learned step / decimal pattern, restore .99
+  endings, integer cast if integer).
+- Re-apply **zero-inflation** (force the learned fraction of zeros).
+This reproduces multimodality, spikes, and bounds automatically because it samples the real shape.
+
+### C2. `empirical_categorical`
+Sample from the full value→prob map; when `_other_` is drawn, draw from the stored tail pool.
+Preserve null rate.
+
+### C3. `learned_pattern`
+Fill the learned mask using the per-position observed alphabets and length distribution; respect
+learned prefixes/suffixes. Enforce uniqueness here if the column is unique (generate then
+de-dup by re-rolling, not by appending `_1`).
+
+### C4. `empirical_datetime`
+Sample dates honoring dow/hour/month weights and trend (or bootstrap from the real timestamp pool
+when present), within the learned anchors and granularity; format per spec.
+
+### C5. `copula_member` + table `joint_model` (the centerpiece)
+When a table has a `joint_model` of type `gaussian_copula`:
+1. Draw correlated standard-normal vectors `Z ~ N(0, Σ)` using the stored (PSD) correlation matrix
+   (`np.random.multivariate_normal`).
+2. Convert to uniforms via the normal CDF (`scipy.stats.norm.cdf`).
+3. Push each uniform through that column's **empirical marginal** (inverse-CDF / category map).
+This yields rows where numeric columns are jointly correlated like the source AND each column keeps
+its real marginal shape.
+
+For `conditional_groups`: FIRST sample the `by` categorical columns from their marginals, THEN for
+each group sample the `targets` from that group's stored conditional marginal (and run the copula on
+the residual numeric columns within-group if both apply).
+
+### C6. Constraint enforcement WITHOUT distribution corruption (fix `_enforce_constraints`)
+- For out-of-range numerics, **resample/reject-sample** (re-draw from the empirical marginal) up to
+  K attempts before any clamp; only clamp as a final guard with a logged warning. Never make
+  edge-piling the default.
+- For uniqueness, **re-roll** duplicates from the generator rather than mutating values with
+  `_counter` suffixes/offsets. If exhaustion is possible, fail fast via the validator (Prompt's
+  Part E) BEFORE generation.
+- Apply arithmetic intra-row rules AFTER sampling so derived columns are exact.
+
+### C7. Semantic-record consistency (addresses finding #4) — interface only here
+Where the profiler emits `semantic_record`, generate the bundled fields from a single Faker record
+per row (one `fake.profile()` / locale-consistent draw) so name/email/address/city/state/zip/
+country are mutually consistent. Detect the locale from the source data when possible (e.g. country
+distribution) and seed Faker with it. Leave the LLM-swap interface intact.
+
+---
+
+## PART D — CONTENT-BASED SEMANTIC DETECTION (replaces name-only `_guess_semantic`)
+
+Add a `replicator/semantics.py` (or extend profiler) that classifies a column's semantic type by
+**inspecting its values** (sampled), with column name as a secondary signal/tiebreaker:
+- email / phone / url / uuid / ip via regex on a sample (≥ threshold match rate).
+- name / first_name / last_name / company / address / city / state / zip / country via value-set
+  membership checks against Faker/locale dictionaries or strong patterns, not just the header text.
+- Group co-located geo/identity fields into a `semantic_record` bundle so they are generated
+  consistently together (Part C7).
+Name-keyword matching remains as a fallback only.
+
+---
+
+## PART E — VALIDATOR UPDATES (backend/engine/validator.py)
+
+Keep all existing checks. ADD pre-generation feasibility checks for the new strategies:
+- `learned_pattern` + `unique`: assert the mask's value space ≥ row_count (else conflict, like the
+  existing 3-digit-code check).
+- `empirical_sample`/`copula_member`: assert a marginal payload (or sidecar reference) is present
+  and resolvable; assert the correlation matrix is square, matches `joint_model.columns`, and is
+  PSD (or auto-correct + warn).
+- `empirical_categorical`: probabilities (incl. `_other_`) sum to ~1.0.
+Fail BEFORE generating with a clear message listing the conflict.
+
+---
+
+## PART F — DETERMINISM, PERFORMANCE, ROBUSTNESS
+
+- **Seeding:** thread a `seed` through `generate()` and the profiler so a (spec, seed) pair is
+  reproducible. Keep the global `np.random.seed(42)`/`Faker.seed(42)` defaults but allow override.
+- **Scale:** must handle 1→N tables and up to ~100 columns/table and large row counts. Sample for
+  expensive learning steps (correlation, content sniffing) on ≤50k rows like the existing code does;
+  generate at full scale vectorized with NumPy (avoid Python row loops on hot paths).
+- **Missing/edge data:** all-null columns, single-value columns, constant columns, huge-cardinality
+  text, mixed-type columns — handle each gracefully with logged fallbacks, never crash.
+- **Logging:** log every learning decision (chosen strategy + why) at INFO so the choices are
+  auditable.
+
+---
+
+## PART G — TESTS & PROOF OF REALISM (REQUIRED — do not skip)
+
+Create `backend/tests/test_realism.py` that, for several synthetic-but-realistic source tables
+(include: a bimodal salary column; a price column with .99 endings; a country→currency dependency;
+an age↔income correlation; a parent/child orders table; an ID column like `ABC-1234`):
+1. Profiles the source → spec, generates a replica at the same row count.
+2. Asserts **per-column** distributional closeness: KS p-value above threshold for numerics AND
+   **percentile alignment** (the generated 10/25/50/75/90/99th percentiles within a tolerance of the
+   source's), category-frequency L1 distance below threshold.
+3. Asserts **joint** closeness: the generated Spearman correlation matrix is within tolerance of the
+   source's (Frobenius norm of the difference below threshold).
+4. Asserts **consistency**: country→currency mapping is never violated; tier→spend ordering holds.
+5. Asserts **format**: every generated ID matches the source mask regex.
+6. Asserts **referential integrity** = 100% and **intra-row constraints** pass-rate = 100%.
+Print a short fidelity summary. These tests are the definition of done.
+
+---
+
+## ACCEPTANCE CRITERIA
+
+- All existing example specs and Creator mode still generate without error (backward compatible).
+- For any uploaded table(s), Replicator output reproduces, within tolerance: each column's
+  **percentile curve**, **category frequencies**, **null rates**, **rounding/format**, the
+  **cross-column correlation matrix**, **categorical→target consistency**, **temporal structure**,
+  and **parent/child cardinality + conditional shifts**.
+- No edge-piling from clamping; no value-mutation from uniqueness repair on hot paths.
+- `backend/tests/test_realism.py` passes.
+- Code is typed, logged, deterministic under a seed, and handles 1→N tables / 1→100+ columns.
+
+Implement everything end-to-end. Do not leave TODOs or stubs in the sampling, profiling, copula,
+conditional-group, pattern, datetime, or constraint paths.
